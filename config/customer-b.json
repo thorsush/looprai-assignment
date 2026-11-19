@@ -1,0 +1,6 @@
+{
+  "tenantId": "tenant-b",
+  "workspaceId": "packaging",
+  "fields": ["sessionId", "id", "result", "imageUrl"],
+  "outputFilename": "customer-b.csv"
+}

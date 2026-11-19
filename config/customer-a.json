@@ -1,0 +1,7 @@
+{
+  "tenantId": "tenant-a",
+  "workspaceId": "assembly",
+  "fields": ["id", "timestamp", "result", "confidence"],
+  "resultFilter": "FAIL",
+  "outputFilename": "customer-a.csv"
+}

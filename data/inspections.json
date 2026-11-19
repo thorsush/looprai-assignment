@@ -1,0 +1,114 @@
+[
+  {
+    "id": "a-001",
+    "tenantId": "tenant-a",
+    "workspaceId": "assembly",
+    "sessionId": "a-s1",
+    "timestamp": "2026-01-10T09:00:00Z",
+    "result": "PASS",
+    "confidence": 0.98,
+    "imageUrl": "https://example.com/a-001.jpg"
+  },
+  {
+    "id": "a-002",
+    "tenantId": "tenant-a",
+    "workspaceId": "assembly",
+    "sessionId": "a-s1",
+    "timestamp": "2026-01-10T09:01:00Z",
+    "result": "FAIL",
+    "confidence": 0.91
+  },
+  {
+    "id": "a-003",
+    "tenantId": "tenant-a",
+    "workspaceId": "assembly",
+    "sessionId": "a-s2",
+    "timestamp": "2026-01-11T09:00:00Z",
+    "result": "FAIL",
+    "confidence": 0.87,
+    "imageUrl": "https://example.com/a-003.jpg"
+  },
+  {
+    "id": "a-004",
+    "tenantId": "tenant-a",
+    "workspaceId": "assembly",
+    "sessionId": "a-s2",
+    "timestamp": "2026-01-11T09:01:00Z",
+    "result": "PASS",
+    "confidence": 0.96
+  },
+  {
+    "id": "a-005",
+    "tenantId": "tenant-a",
+    "workspaceId": "packaging",
+    "sessionId": "a-s3",
+    "timestamp": "2026-01-12T09:00:00Z",
+    "result": "PASS",
+    "confidence": 0.99
+  },
+  {
+    "id": "a-006",
+    "tenantId": "tenant-a",
+    "workspaceId": "packaging",
+    "sessionId": "a-s3",
+    "timestamp": "2026-01-12T09:01:00Z",
+    "result": "FAIL",
+    "confidence": 0.89
+  },
+  {
+    "id": "b-001",
+    "tenantId": "tenant-b",
+    "workspaceId": "packaging",
+    "sessionId": "b-s1",
+    "timestamp": "2026-01-10T10:00:00Z",
+    "result": "PASS",
+    "confidence": 0.97,
+    "imageUrl": "https://example.com/b-001.jpg"
+  },
+  {
+    "id": "b-002",
+    "tenantId": "tenant-b",
+    "workspaceId": "packaging",
+    "sessionId": "b-s1",
+    "timestamp": "2026-01-10T10:01:00Z",
+    "result": "FAIL",
+    "confidence": 0.92
+  },
+  {
+    "id": "b-003",
+    "tenantId": "tenant-b",
+    "workspaceId": "packaging",
+    "sessionId": "b-s2",
+    "timestamp": "2026-01-11T10:00:00Z",
+    "result": "PASS",
+    "confidence": 0.95,
+    "imageUrl": "https://example.com/b-003.jpg"
+  },
+  {
+    "id": "b-004",
+    "tenantId": "tenant-b",
+    "workspaceId": "packaging",
+    "sessionId": "b-s2",
+    "timestamp": "2026-01-11T10:01:00Z",
+    "result": "FAIL",
+    "confidence": 0.88
+  },
+  {
+    "id": "b-005",
+    "tenantId": "tenant-b",
+    "workspaceId": "assembly",
+    "sessionId": "b-s3",
+    "timestamp": "2026-01-12T10:00:00Z",
+    "result": "PASS",
+    "confidence": 0.99
+  },
+  {
+    "id": "b-006",
+    "tenantId": "tenant-b",
+    "workspaceId": "assembly",
+    "sessionId": "b-s3",
+    "timestamp": "2026-01-12T10:01:00Z",
+    "result": "FAIL",
+    "confidence": 0.9
+  }
+]

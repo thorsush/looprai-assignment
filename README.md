@@ -1,20 +1,23 @@
-# Loopr customer-configurable exports — Stage 2
+# Loopr customer-configurable exports — Stage 3
 
-This learning project extends the Stage 1 TypeScript CSV exporter with a minimal NestJS HTTP API and MongoDB persistence. It is not the complete assignment. The original framework-independent exporter, sample JSON, configurations, CLI, and business-rule tests remain available.
+This incremental learning project extends the Stage 1 CSV exporter and Stage 2 NestJS/MongoDB API with background export jobs using BullMQ and Redis. It is not the complete assignment.
 
-## Model and architecture
+## Architecture and lifecycle
 
-A tenant has workspaces; workspaces contain inspection sessions and records. The 12 sample records have tenant, workspace, session and record IDs, a timestamp, result, confidence and optional image URL. Names can overlap across tenants.
+A tenant has workspaces; each workspace has sessions and inspection records. The sample JSON contains 12 records. The seed upserts them into MongoDB by record ID. JSON remains available for the original Stage 1 CLI.
 
-NestJS supplies the HTTP controller, DTO validation, dependency wiring, and application lifecycle. MongoDB replaces JSON as the API's runtime data source and persists both `inspections` and `export_jobs` across application restarts; the JSON file remains the seed source and supports the Stage 1 CLI. The seed uses an upsert by inspection ID, so it can be rerun without duplicating records.
+1. `POST /exports` validates the request, creates a MongoDB job with `QUEUED` status, and submits its MongoDB ID to the Redis-backed BullMQ queue. It returns HTTP 202 without waiting for the CSV.
+2. The BullMQ processor in the same NestJS process picks up the job, sets `PROCESSING`, and reads inspection records scoped to both tenant and workspace. The existing framework-independent exporter filters results, selects columns and escapes CSV.
+3. The processor updates the MongoDB counts and percentage in batches of two selected records. It writes a unique temporary file, records its SHA-256 checksum, then atomically renames the file to `output/<job-id>.csv` on the same filesystem. Only then does it mark the job `COMPLETED`.
+4. Clients poll `GET /exports/:id` and use `GET /exports/:id/download` once complete. Failed or unfinished downloads return 409; a missing job or output file returns 404.
 
-For `POST /exports`, Nest validates the DTO, creates a PENDING job, marks it PROCESSING, queries inspections using both tenant and workspace, and passes them to the existing CSV functions. Those functions apply the optional result filter, choose the requested columns in order, escape CSV, and neutralize formula-like string values. The service writes a job-ID-named file in `output/` and marks the job COMPLETED, or records FAILED with a safe error message. Jobs store tenant and workspace IDs, the request configuration, status, optional output path or error, creation time, and completion time. MongoDB's `_id` is exposed as `id`.
+MongoDB stores the configuration, status, counts, attempt count, timestamps and safe errors. Redis stores BullMQ queue state, schedules retries and coordinates workers; it is not the source of truth for the API's job details. The controller handles HTTP, the service creates and retrieves jobs, and the processor performs exports. Three attempts are configured with exponential backoff starting at two seconds and worker concurrency two. Completed queue entries are retained for one day and failures for seven days (BullMQ removes aged entries lazily).
 
-Exports run **synchronously during the HTTP request** and all selected records are loaded into memory. This is unsuitable for large datasets. A database outage can prevent a status update; there is no crash recovery. A completed job also depends on its local output file remaining available.
+Progress counts **selected records** processed into the in-memory CSV, after the result filter. A value of 100 does not guarantee that the file is published or durable; check `COMPLETED`. With this small dataset a job may complete before polling observes intermediate percentages.
 
-## Start locally
+## Run locally
 
-Requirements: Node.js 20 or newer, npm, and Docker with Compose (or an existing MongoDB instance).
+Requirements: Node.js 20+, npm and Docker Compose. From the project root:
 
 ```sh
 npm install
@@ -24,11 +27,9 @@ npm run seed
 npm run start
 ```
 
-The seed can be run repeatedly. MongoDB data is kept in a Docker volume. The default MongoDB URI and port are in `.env.example`; set `MONGODB_URI` and `PORT` in `.env` as needed. Run commands from the project root so data and output paths resolve correctly.
+The seed is safe to repeat. MongoDB uses a Docker volume. Redis connection settings and the server port are in `.env`. The API and worker use the same local `output/` directory and must share it if separated into processes.
 
-## Use the API
-
-In another terminal, create an export (the sample workspace is `assembly`):
+Create an export (the sample workspace is `assembly`):
 
 ```sh
 curl -sS -X POST http://localhost:3000/exports \
@@ -36,28 +37,37 @@ curl -sS -X POST http://localhost:3000/exports \
   -d '{"tenantId":"tenant-a","workspaceId":"assembly","fields":["id","result","timestamp"],"filters":{"result":"FAIL"}}'
 ```
 
-The response is similar to `{"id":"507f1f77bcf86cd799439011","status":"COMPLETED"}`. Copy its ID into the following commands:
+Copy the returned `id` into the following commands:
 
 ```sh
-JOB_ID=507f1f77bcf86cd799439011
+JOB_ID=replace-with-returned-id
 curl -sS "http://localhost:3000/exports/$JOB_ID"
 curl -fS "http://localhost:3000/exports/$JOB_ID/download" -o export.csv
 ```
 
-A missing job or missing file returns 404; a job that is not completed returns 409. Unknown request properties, invalid fields, duplicate fields, invalid filters, and non-string tenant/workspace identifiers return 400. Filenames are generated internally; download paths are derived from a validated job ID.
+To observe an automatic retry, run in development mode (do not set `NODE_ENV=production`):
 
-Run both the Jest service/validation tests and the original Stage 1 Node tests:
+```sh
+curl -sS -X POST http://localhost:3000/exports \
+  -H 'Content-Type: application/json' \
+  -d '{"tenantId":"tenant-a","workspaceId":"assembly","fields":["id","result"],"simulateFailure":true}'
+```
+
+Poll its ID as above. The first attempt fails deterministically; after the two-second backoff the second succeeds. In production, requests specifying `simulateFailure` are rejected and the processor ignores it.
 
 ```sh
 npm test
+npm run export -- config/customer-a.json
 ```
 
-The original CLI remains available with `npm run export -- config/customer-a.json` (or `config/customer-b.json`). It reads JSON directly and does not create a database job.
+The first command runs Jest job tests and the preserved Stage 1 Node tests. The second runs the original standalone JSON-based CLI without creating a database job.
 
-## Security and deferred work
+## Reliability and boundaries
 
-Tenant and workspace are included in every inspection query, and DTO validation rejects object-valued IDs that could act as MongoDB operators. CSV escaping handles commas, quotes and newlines; missing values are empty. Formula-like strings are prefixed with an apostrophe, including after leading whitespace or control characters.
+BullMQ is **at least once**, not exactly once. Attempts write separate temporary files rather than appending. A checksum stored before the atomic rename lets a retry verify and finalize a published file after a crash; the completed file is never marked complete before publication. Attempt IDs guard MongoDB updates so an old failure cannot overwrite a completed job. Temporary files are removed on normal completion or caught errors; an abrupt process termination may leave orphaned temporary files that require manual cleanup. A local file and rename do not provide distributed durability, and simultaneous stalled executions can still race over the final path: this is not a full fencing protocol.
 
-**This is not secure multi-tenant authentication.** Anyone who can reach this API can supply a tenant ID or access a job ID. Production must derive tenant identity from an authenticated authorization context and authorize job lookup and downloads.
+MongoDB and Redis do not share a transaction. An enqueue error records a safe failure and returns 503, but a crash between MongoDB creation and enqueue can leave a `QUEUED` record with no queue entry. A network error can also make enqueue outcome ambiguous. There is no transactional outbox or automatic reconciliation in this stage. If MongoDB is unavailable during error handling, the job status may be stale. Redis and local-file persistence depend on the local environment; Compose's Redis is for development, not durable production setup.
 
-There are no background workers, retries, crash recovery, scheduling, large-dataset streaming, real tenant authentication, S3/object storage, or ERP integration. These belong to later stages, not this implementation.
+CSV escapes commas, quotes and line breaks, uses empty cells for missing values, and prefixes formula-like strings with an apostrophe. Tenant and workspace are both included in every inspection query. **Caller-supplied tenant IDs are not authentication**: job lookup and download are also unauthenticated. Production must derive tenant identity from authenticated authorization context and enforce access to each job.
+
+The prototype loads records and CSV into memory. It has no scheduling, streaming for large datasets, S3, ERP integration, or separate deployable workers. Stage 4 may improve checkpointing, crash recovery and distributed durability; those capabilities are not implemented here.

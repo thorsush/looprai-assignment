@@ -34,45 +34,83 @@ test('inspection database query includes tenant and workspace', async () => {
   expect(find).toHaveBeenCalledWith({ tenantId: 'tenant-a', workspaceId: 'assembly' });
 });
 
+
 describe('export jobs', () => {
-  let dir, job, jobs, inspections, service;
+  let dir, state, jobs, inspections, queue, service, processor;
+  const { ExportsProcessor } = require('../dist/src/exports/exports.processor');
+  const { ExportsController } = require('../dist/src/exports/exports.controller');
+  const { HTTP_CODE_METADATA } = require('@nestjs/common/constants');
+  const query = (value) => ({ lean: () => ({ exec: async () => value }) });
+  const matches = (filter) => !filter.status || (typeof filter.status === 'object' ? filter.status.$in.includes(state.status) : filter.status === state.status) && (!filter.activeRunId || filter.activeRunId === state.activeRunId);
+  const apply = (update) => { Object.assign(state, update.$set || {}); for (const key of Object.keys(update.$unset || {})) delete state[key]; };
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'looprai-test-'));
-    job = { id, status: 'PENDING', save: jest.fn().mockResolvedValue(undefined) };
-    jobs = { create: jest.fn().mockResolvedValue(job), findById: jest.fn() };
+    state = { _id: id, tenantId: 'tenant-a', workspaceId: 'assembly', config, status: 'QUEUED', progress: 0 };
+    jobs = {
+      create: jest.fn(async (doc) => { Object.assign(state, doc); return { id }; }),
+      findById: jest.fn(() => query({ ...state })),
+      findOneAndUpdate: jest.fn((filter, update) => { if (!matches(filter)) return query(null); apply(update); return query({ ...state }); }),
+      updateOne: jest.fn(async (filter, update) => { if (!matches(filter)) return { matchedCount: 0 }; apply(update); return { matchedCount: 1 }; }),
+    };
     inspections = { findForWorkspace: jest.fn().mockResolvedValue([record]) };
-    service = new ExportsService(jobs, inspections);
-    service.outputDir = dir;
+    queue = { add: jest.fn().mockResolvedValue(undefined) };
+    service = new ExportsService(jobs, queue); service.outputDir = dir;
+    processor = new ExportsProcessor(jobs, inspections); processor.outputDir = dir;
   });
   afterEach(async () => rm(dir, { recursive: true, force: true }));
+  const queued = (attemptsMade = 0) => ({ data: { exportJobId: id }, attemptsMade, opts: { attempts: 3 } });
 
-  test('creates and completes a job with selected CSV', async () => {
-    await expect(service.create(config)).resolves.toEqual({ id, status: 'COMPLETED' });
-    expect(jobs.create).toHaveBeenCalledWith(expect.objectContaining({ status: 'PENDING', tenantId: 'tenant-a', config }));
-    expect(job.save).toHaveBeenCalledTimes(2);
-    expect(inspections.findForWorkspace).toHaveBeenCalledWith('tenant-a', 'assembly');
-    expect(await readFile(join(dir, `${id}.csv`), 'utf8')).toBe('result,id\r\nFAIL,a-1\r\n');
-    expect(job.outputPath).toBe(`output/${id}.csv`);
-    expect(job.completedAt).toBeInstanceOf(Date);
+  test('creates a queued job, submits its ID, and exposes HTTP 202', async () => {
+    await expect(service.create(config)).resolves.toEqual({ id, status: 'QUEUED' });
+    expect(jobs.create).toHaveBeenCalledWith(expect.objectContaining({ status: 'QUEUED', config }));
+    expect(queue.add).toHaveBeenCalledWith('export', { exportJobId: id }, { jobId: id });
+    expect(Reflect.getMetadata(HTTP_CODE_METADATA, ExportsController.prototype.create)).toBe(202);
   });
-  test('records a safe failure when generation fails', async () => {
-    inspections.findForWorkspace.mockRejectedValue(new Error('secret database details'));
-    await expect(service.create(config)).resolves.toEqual({ id, status: 'FAILED' });
-    expect(job.error).toBe('Export failed');
-    expect(job.outputPath).toBeUndefined();
+  test('records queue submission failure safely', async () => {
+    queue.add.mockRejectedValue(new Error('redis password'));
+    await expect(service.create(config)).rejects.toMatchObject({ status: 503 });
+    expect(state).toMatchObject({ status: 'FAILED', error: 'Could not enqueue export' });
+  });
+  test('worker scopes records, updates progress and creates CSV', async () => {
+    await processor.process(queued());
+    expect(inspections.findForWorkspace).toHaveBeenCalledWith('tenant-a', 'assembly');
+    expect(state).toMatchObject({ status: 'COMPLETED', progress: 100, processedRecords: 1, totalRecords: 1, attemptCount: 1 });
+    expect(jobs.updateOne).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ $set: expect.objectContaining({ processedRecords: 1 }) }));
+    expect(await readFile(join(dir, `${id}.csv`), 'utf8')).toBe('result,id\r\nFAIL,a-1\r\n');
+  });
+  test('failure retries successfully without duplicate output and completed jobs are skipped', async () => {
+    state.config = { ...config, simulateFailure: true };
+    await expect(processor.process(queued())).rejects.toThrow();
+    expect(state.status).toBe('QUEUED');
+    await processor.process(queued(1));
+    expect(state).toMatchObject({ status: 'COMPLETED', attemptCount: 2 });
+    expect(await readFile(join(dir, `${id}.csv`), 'utf8')).toBe('result,id\r\nFAIL,a-1\r\n');
+    await processor.process(queued(2));
+    expect(inspections.findForWorkspace).toHaveBeenCalledTimes(2);
+  });
+  test('exhausted attempts mark the job failed without exposing the error', async () => {
+    inspections.findForWorkspace.mockRejectedValue(new Error('sensitive'));
+    await expect(processor.process(queued(2))).rejects.toThrow();
+    expect(state).toMatchObject({ status: 'FAILED', error: 'Export failed', attemptCount: 3 });
   });
   test('only completed jobs with files can be downloaded', async () => {
-    const find = (status) => jobs.findById.mockReturnValue({ lean: () => ({ exec: async () => status ? { _id: id, status } : null }) });
-    for (const status of ['PENDING', 'PROCESSING', 'FAILED']) {
-      find(status);
+    for (const status of ['QUEUED', 'PROCESSING', 'FAILED']) {
+      state.status = status;
       await expect(service.download(id)).rejects.toMatchObject({ status: 409 });
     }
-    find(null);
-    await expect(service.download(id)).rejects.toMatchObject({ status: 404 });
     await expect(service.download('../secret')).rejects.toMatchObject({ status: 404 });
-    find('COMPLETED');
+    state.status = 'COMPLETED';
     await expect(service.download(id)).rejects.toMatchObject({ status: 404 });
-    await service.create(config);
+    state.status = 'QUEUED';
+    await processor.process(queued());
     expect((await service.download(id)).toString()).toBe('result,id\r\nFAIL,a-1\r\n');
+  });
+  test('recovers a published file using its checksum after a crash', async () => {
+    await processor.process(queued());
+    state.status = 'PROCESSING'; delete state.completedAt;
+    inspections.findForWorkspace.mockClear();
+    await processor.process(queued(1));
+    expect(state.status).toBe('COMPLETED');
+    expect(inspections.findForWorkspace).not.toHaveBeenCalled();
   });
 });

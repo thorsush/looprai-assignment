@@ -6,8 +6,11 @@ import { CreateExportDto } from "./dto/create-export.dto";
 export class ExportJob {
   @Prop({ required: true }) tenantId!: string;
   @Prop({ required: true }) workspaceId!: string;
-  @Prop({ type: MongooseSchema.Types.Mixed, required: true })
+  @Prop({ type: MongooseSchema.Types.Mixed, required: true, immutable: true })
   config!: CreateExportDto;
+  @Prop({ default: "inspection-report", immutable: true }) configId!: string;
+  @Prop({ default: 1, immutable: true }) configVersion!: number;
+  @Prop({ default: 1, immutable: true }) outputSchemaVersion!: number;
   @Prop({
     enum: ["QUEUED", "PROCESSING", "COMPLETED", "FAILED"],
     required: true,

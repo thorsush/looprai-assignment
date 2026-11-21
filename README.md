@@ -1,34 +1,48 @@
-# Loopr customer-configurable exports — Stage 4
+# Loopr Customer-Configurable Data Export
 
-This learning project extends the Stage 1 CSV logic, Stage 2 NestJS/MongoDB API and Stage 3 BullMQ queue with bounded batches, durable checkpoints and local crash recovery. It is not the complete assignment.
+A small multi-tenant export platform built in stages. The working workflow accepts a customer-specific CSV configuration, queues a job, reads tenant-scoped inspection records in bounded batches, writes a locally recoverable CSV, and exposes job progress and download APIs. It demonstrates the export core; it is not a production-ready commercial service or a complete implementation of every destination scenario.
+
+See [docs/DESIGN.md](docs/DESIGN.md) for architecture, recovery behavior, S3/ERP/scheduling proposals and version migration. See [docs/SUBMISSION.md](docs/SUBMISSION.md) for the implementation summary and [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) for requirement-by-requirement status.
+
+## Implemented features
+
+- NestJS REST API, MongoDB inspection/job persistence, and Redis/BullMQ background work.
+- Customer field selection and PASS/FAIL filter, with tenant and workspace isolation in every inspection query.
+- CSV escaping, missing-value handling, and spreadsheet formula-injection protection from the original standalone exporter.
+- Keyset pagination, fixed export upper bound, batch progress, byte-offset checkpoint, retry recovery and atomic local-file publication.
+- Immutable configuration revision registry, per-job snapshots, and separate output schema version metadata.
+- Sample data for two tenants, multiple workspaces/sessions, two Stage 1 customer configs, unit tests and a real MongoDB worker restart test.
+
+Image uploads to S3, scheduled exports and ERP API integration are design-only proposals. There is no frontend, authentication, or Stage 5 destination implementation.
 
 ## Architecture
 
-`POST /exports` validates a customer configuration, snapshots it in a MongoDB job and queues its ID in Redis/BullMQ; it returns HTTP 202. The worker reads inspections for that tenant and workspace, generates the CSV, and checkpoints each committed batch. `GET /exports/:id` exposes status and progress, and `GET /exports/:id/download` streams a completed file. The API and worker are in one NestJS process. Run **only one instance** of this application for Stage 4; worker concurrency is one. Redis schedules up to three attempts with exponential backoff starting at two seconds.
+```mermaid
+flowchart LR
+  Client --> API[NestJS API]
+  API --> Jobs[(MongoDB export_jobs)]
+  API --> Queue[(Redis BullMQ)]
+  Queue --> Worker[ExportsProcessor]
+  Worker --> Jobs
+  Worker --> Reader[InspectionsService]
+  Reader --> Data[(MongoDB inspections)]
+  Worker --> CSV[Existing CSV exporter]
+  CSV --> Part[output/job-id.part]
+  Part -->|sync + rename| Final[output/job-id.csv]
+  Client -->|poll/download| API
+```
 
-The sample JSON contains 12 records arranged as tenant → workspace → session → inspection; the seed upserts by inspection ID. The Stage 1 CLI and CSV functions remain available. Result filters, selected field order, CSV escaping and spreadsheet-formula protection are unchanged. Configuration is stored on the job, rather than read from a mutable customer configuration during processing.
+The API validates and snapshots configuration, creates a `QUEUED` job and enqueues its MongoDB ID. The worker marks it `PROCESSING`, captures an upper-bound ID, reads bounded sorted batches, writes and syncs CSV, then commits a checkpoint. After final sync and atomic rename, the job becomes `COMPLETED`. MongoDB is the source of truth for status; Redis coordinates work and retries.
 
-## Batches and consistency
+## Stack and prerequisites
 
-At the first attempt, the worker persists the largest matching inspection ID, a count, and `EXPORT_BATCH_SIZE` (default 1000) with the job. It queries each next batch by tenant, workspace, optional result, `id > lastProcessedId`, and `id <= upperBoundId`, sorted by `id` with MongoDB's simple binary collation. It does not use `skip`, whose work increases with the offset and whose pages shift when records are inserted. The inspection schema includes compound indexes for both filtered and unfiltered queries.
+- Node.js 20 or newer and npm
+- Docker with Compose
+- MongoDB 7 and Redis 7 (provided by Compose)
 
-Sample IDs are unique immutable strings such as `a-001`; ordering is **binary lexicographic**, not numeric (`a-10` sorts before `a-2`). This stage assumes records are append-only, IDs are unique and immutable, and newly visible IDs for a tenant/workspace are always greater than earlier visible IDs. The fixtures illustrate ordering but do not enforce a production ID allocator. The upper bound excludes later higher IDs; it is **not snapshot isolation** if records change, are deleted, backfilled or become visible out of order. A production ingestion system must enforce the assumptions or use a stronger snapshot mechanism.
+## Local setup
 
-## Checkpoints and recovery
-
-The job stores `upperBoundId`, `lastProcessedId`, `processedRecords`, `totalRecords`, `outputOffsetBytes`, `batchSize`, `checkpointVersion`, status, attempts and timestamps. An offset is a **byte count**, not a character count. Progress counts committed selected records; 100% alone does not mean the final file has been published.
-
-The worker writes a header once into `output/<id>.part`. For each bounded batch it serializes only that batch using the existing CSV logic, writes all bytes, syncs the file, and only then saves the offset and last ID to MongoDB. On retry, a file longer than the saved offset is truncated to it and synced; the worker resumes after the saved ID. A missing or shorter file with a nonzero offset is an unrecoverable local-file error. This avoids silently skipping data.
-
-For example, with `id,result` and batch size 3, the header is 11 bytes. Rows `a-001,PASS`, `a-002,FAIL`, and `a-003,FAIL` each occupy 12 bytes including CRLF. After committing them, the checkpoint is `lastProcessedId=a-003`, `processedRecords=3`, `outputOffsetBytes=47`. If `a-004` is written and synced but the worker dies before the next checkpoint, the file is 59 bytes while MongoDB still says 47. Recovery truncates it back to 47 and writes `a-004` again, resulting in one row for that ID.
-
-After the last batch, the worker syncs the file, records a streaming SHA-256 hash and final offset, atomically renames it on the same filesystem to `output/<id>.csv`, syncs the containing directory, then marks the job `COMPLETED`. A retry after rename checks finalization metadata, size and hash before completing the job. Inconsistent final files are rejected. Directory sync is not supported by every filesystem or operating system; errors are surfaced instead of claiming successful durable publication. Existing Stage 3 jobs and files do not have Stage 4 offsets and should be completed or migrated before upgrading; this prototype does not migrate them.
-
-The protocol assumes one active writer and a durable local filesystem. BullMQ is at least once: processing may repeat after a crash. Truncation and checkpointing aim to produce one copy of each record under the stated assumptions; they do not guarantee exactly-once execution. Queue locks do not fence a stale process after lock loss, and the filesystem is not a distributed durable store. Multiple app/worker instances or a delayed stale worker can violate the single-writer assumption.
-
-## Local setup and APIs
-
-Install Node.js 20+, npm and Docker Compose. From the project root:
+From the repository root:
 
 ```sh
 npm install
@@ -38,28 +52,51 @@ npm run seed
 npm run start
 ```
 
-For a small demonstration, set `EXPORT_BATCH_SIZE=3` in `.env` before starting. MongoDB uses a Docker volume. The seed can be repeated without duplicate records. Use a single app instance and keep its `output/` on the same persistent filesystem across restarts.
+Set `EXPORT_BATCH_SIZE=3` in `.env` to make several batches visible in the sample. The default is 1,000. Run a single application/worker process: the local partial-file protocol assumes one writer. The API and worker use the same local `output/` directory.
+
+`.env.example` defines `MONGODB_URI`, `REDIS_HOST`, `REDIS_PORT`, `PORT`, and `EXPORT_BATCH_SIZE`. Do not commit `.env` or secrets. Run `npm run seed` again safely; it upserts sample inspections by ID.
+
+## API
+
+Create a CSV export. Legacy requests default to configuration ID `inspection-report`, revision 1, and output schema version 1.
 
 ```sh
 curl -sS -X POST http://localhost:3000/exports \
   -H 'Content-Type: application/json' \
-  -d '{"tenantId":"tenant-a","workspaceId":"assembly","fields":["id","result"]}'
+  -d '{"tenantId":"tenant-a","workspaceId":"assembly","configId":"inspection-report","version":1,"type":"csv","outputSchemaVersion":1,"fields":["id","result","timestamp"],"filters":{"result":"FAIL"}}'
+```
+
+The API returns HTTP 202 with a job ID. Poll progress and download after completion:
+
+```sh
 JOB_ID=replace-with-returned-id
 curl -sS "http://localhost:3000/exports/$JOB_ID"
 curl -fS "http://localhost:3000/exports/$JOB_ID/download" -o export.csv
 ```
 
-The sample configuration exports four records in two batches at size 3. A missing job or output returns 404; an unfinished or failed job cannot be downloaded (409). The original standalone example remains available with `npm run export -- config/customer-a.json`.
+The job response includes config revision/schema version, status, progress, processed/total records, attempt count and checkpoint metadata. Download is unavailable until `COMPLETED`. The Stage 1 standalone JSON CLI remains available with `npm run export -- config/customer-a.json` or `config/customer-b.json`.
 
-## Tests and reproducible interruption
+## Recovery demonstration and tests
 
 ```sh
 npm test
 TEST_MONGODB_URI=mongodb://127.0.0.1:27017/looprai_recovery_test npm test
 ```
 
-The first command runs unit tests and skips the MongoDB-dependent test if the variable is absent. The second also creates a temporary tenant and job in that database, launches a separate worker using batch size 3, waits until a batch has been synced but **before** its checkpoint is saved, sends SIGKILL, then starts a new worker process. It prints checkpoint state before and after recovery and verifies the final CSV has eight distinct records. Test records and temporary files are cleaned up. This is a real process interruption using MongoDB; it invokes the worker directly, rather than testing BullMQ lock-loss redelivery. Other crash points use deterministic in-process test hooks, not public request fields. The regular API path can be checked separately using the commands above with MongoDB and Redis running.
+The first command builds the project, runs Jest unit tests, then the preserved Node test suite. The MongoDB-dependent process-restart test is skipped when `TEST_MONGODB_URI` is unset. The second command runs it against a real MongoDB database: a child worker syncs its first batch and is killed before checkpointing, then a restarted worker truncates the uncommitted bytes and completes the CSV. Test data is removed afterward.
 
-## Remaining limitations
+In-process test hooks also simulate interruption before write, after write/before checkpoint, after checkpoint, and after final rename. These hooks are not accepted in the HTTP DTO. In-memory simulations test the failure points; only the child-process test models actual process termination.
 
-MongoDB and Redis do not share a transaction. A crash between creating a MongoDB job and enqueueing it can leave a queued job without a queue entry; an enqueue error can have an ambiguous outcome. There is no outbox or automatic reconciliation. Data and checkpoints depend on local disk durability, and downloading relies on the same filesystem. There is no distributed fencing, database snapshot, scheduling, S3, ERP integration, or authentication. **Caller-supplied tenant IDs are not authorization**; production must derive tenant identity from an authenticated context and authorize job access. The `simulateFailure` request field from Stage 3 is no longer accepted; failure injection is test-only.
+## Versioning and compatibility
+
+A configuration revision identifies customer settings; an output schema version identifies the CSV contract. The first resolved definition for `(tenantId, configId, version)` is stored in an immutable registry; reusing a version with different settings returns 409. Each export also stores its own resolved snapshot, so a newer revision does not change an in-progress job. Version 1 CSV is the only implemented schema. Safe customer migration steps and a sample v1-to-v2 header change are described in the design document. Existing delivered files are never rewritten automatically.
+
+## Limits and security
+
+- Caller-supplied tenant IDs are not authentication. Production must derive tenant identity from an authenticated context and authorize status/download access for every job.
+- String IDs use simple binary lexicographic ordering. Correct upper-bound behavior assumes append-only records, immutable unique IDs, and monotonic insertion visibility per tenant/workspace. An ID upper bound is not database snapshot isolation.
+- Processing is at least once. Checkpoints and truncation aim to prevent duplicate output rows after retries under a single-writer, durable-local-filesystem assumption; they do not guarantee exactly-once execution or distributed durability.
+- MongoDB and Redis do not share a transaction. A crash between job creation and enqueue can leave a queued job without queue state; there is no outbox/reconciliation.
+- No scheduling, S3, ERP, large-dataset snapshot transactions, distributed fencing, tenant fairness/quotas, or production observability are implemented.
+
+Future connector flows and operational recommendations are proposals, not working features. Read [docs/DESIGN.md](docs/DESIGN.md) for details.

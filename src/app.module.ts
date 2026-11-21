@@ -4,6 +4,7 @@ import { BullModule } from "@nestjs/bullmq";
 import { Inspection, InspectionSchema } from "./inspections/inspection.schema";
 import { InspectionsService } from "./inspections/inspections.service";
 import { ExportJob, ExportJobSchema } from "./exports/export-job.schema";
+import { ExportConfigVersion, ExportConfigVersionSchema } from "./exports/export-config-version.schema";
 import { ExportsController } from "./exports/exports.controller";
 import { ExportsService } from "./exports/exports.service";
 import { ExportsProcessor } from "./exports/exports.processor";
@@ -16,6 +17,7 @@ import { ExportsProcessor } from "./exports/exports.processor";
     MongooseModule.forFeature([
       { name: Inspection.name, schema: InspectionSchema },
       { name: ExportJob.name, schema: ExportJobSchema },
+      { name: ExportConfigVersion.name, schema: ExportConfigVersionSchema },
     ]),
     BullModule.forRoot({
       connection: {

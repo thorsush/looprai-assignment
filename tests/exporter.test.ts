@@ -98,3 +98,17 @@ test("CLI writes the expected CSV file", () => {
   assert.equal(readFileSync(path, "utf8"), createCsv(records, config));
   unlinkSync(path);
 });
+
+test("customer configurations produce distinct fields and row sets", () => {
+  const customerA = validateConfig(JSON.parse(readFileSync("config/customer-a.json", "utf8")));
+  const customerB = validateConfig(JSON.parse(readFileSync("config/customer-b.json", "utf8")));
+  const { createCsv } = require("../src/exporter") as typeof import("../src/exporter");
+  const a = createCsv(records, customerA);
+  const b = createCsv(records, customerB);
+  assert.match(a, /^id,timestamp,result,confidence\r\n/);
+  assert.match(b, /^sessionId,id,result,imageUrl\r\n/);
+  assert.match(a, /a-002/);
+  assert.doesNotMatch(a, /b-001/);
+  assert.match(b, /b-001/);
+  assert.doesNotMatch(b, /a-001/);
+});

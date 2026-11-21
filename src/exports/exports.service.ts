@@ -7,12 +7,14 @@ import {
 import { InjectModel } from "@nestjs/mongoose";
 import { InjectQueue } from "@nestjs/bullmq";
 import { Model } from "mongoose";
+import { createHash } from "node:crypto";
 import { Queue } from "bullmq";
 import { access } from "node:fs/promises";
 import { createReadStream, ReadStream } from "node:fs";
 import { join, resolve } from "node:path";
-import { CreateExportDto } from "./dto/create-export.dto";
+import { CreateExportDto, resolveExportConfig } from "./dto/create-export.dto";
 import { ExportJob } from "./export-job.schema";
+import { ExportConfigVersion } from "./export-config-version.schema";
 
 @Injectable()
 export class ExportsService {
@@ -20,13 +22,36 @@ export class ExportsService {
   constructor(
     @InjectModel(ExportJob.name) private readonly jobs: Model<ExportJob>,
     @InjectQueue("exports") private readonly queue: Queue,
+    @InjectModel(ExportConfigVersion.name) private readonly configVersions: Model<ExportConfigVersion>,
   ) {}
 
   async create(config: CreateExportDto) {
+    const requestedSnapshot = resolveExportConfig(config);
+    const fingerprint = createHash("sha256").update(JSON.stringify(requestedSnapshot)).digest("hex");
+    const key = { tenantId: requestedSnapshot.tenantId, configId: requestedSnapshot.configId, version: requestedSnapshot.version };
+    let definition;
+    try {
+      definition = await this.configVersions.findOneAndUpdate(
+        key,
+        { $setOnInsert: { ...key, outputSchemaVersion: requestedSnapshot.outputSchemaVersion, config: requestedSnapshot, fingerprint, createdAt: new Date() } },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      ).lean().exec();
+    } catch (error) {
+      // Concurrent first use may race on the unique version key; read the winner below.
+      if ((error as { code?: number }).code !== 11000) throw error;
+      definition = await this.configVersions.findOne(key).lean().exec();
+    }
+    if (!definition || definition.fingerprint !== fingerprint) {
+      throw new ConflictException("Configuration version is immutable; submit a new version");
+    }
+    const snapshot = definition.config as ReturnType<typeof resolveExportConfig>;
     const job = await this.jobs.create({
-      tenantId: config.tenantId,
-      workspaceId: config.workspaceId,
-      config,
+      tenantId: snapshot.tenantId,
+      workspaceId: snapshot.workspaceId,
+      config: snapshot,
+      configId: snapshot.configId,
+      configVersion: snapshot.version,
+      outputSchemaVersion: snapshot.outputSchemaVersion,
       status: "QUEUED",
     });
     try {

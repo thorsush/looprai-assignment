@@ -38,7 +38,8 @@ run(
       created = await jobs.create({
         tenantId,
         workspaceId: "w",
-        config: { tenantId, workspaceId: "w", fields: ["id", "result"] },
+        config: { configId: "restart-test", version: 1, type: "csv", outputSchemaVersion: 1, tenantId, workspaceId: "w", fields: ["id", "result"] },
+        configId: "restart-test", configVersion: 1, outputSchemaVersion: 1,
         status: "QUEUED",
       });
       const env = {

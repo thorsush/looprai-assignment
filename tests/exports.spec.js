@@ -7,6 +7,8 @@ const { join } = require("node:path");
 const {
   CreateExportDto,
 } = require("../dist/src/exports/dto/create-export.dto");
+const { ExportJobSchema } = require("../dist/src/exports/export-job.schema");
+const { ExportConfigVersion, ExportConfigVersionSchema } = require("../dist/src/exports/export-config-version.schema");
 const { ExportsService } = require("../dist/src/exports/exports.service");
 const {
   InspectionsService,
@@ -48,7 +50,10 @@ test("DTO validates configuration and rejects operator objects, duplicates and i
     { ...config, filters: { result: "pass" } },
     { ...config, filters: { result: { $ne: "PASS" } } },
     { ...config, filters: null },
-    { ...config, outputFilename: "../unsafe.csv" },
+    { ...config, version: 0 },
+    { ...config, version: 1.5 },
+    { ...config, type: "erp" },
+    { ...config, outputSchemaVersion: 2 },
   ])
     await expect(check(bad)).rejects.toThrow();
 });
@@ -63,7 +68,7 @@ test("inspection database query includes tenant, workspace, filter and keyset", 
 });
 
 describe("export jobs", () => {
-  let dir, state, jobs, inspections, queue, service, processor;
+  let dir, state, jobs, inspections, queue, configVersions, definitions, service, processor;
   const { ExportsProcessor } = require("../dist/src/exports/exports.processor");
   const {
     ExportsController,
@@ -113,7 +118,16 @@ describe("export jobs", () => {
       nextBatch: jest.fn(async (_t, _w, _u, last) => last ? [] : [record]),
     };
     queue = { add: jest.fn().mockResolvedValue(undefined) };
-    service = new ExportsService(jobs, queue);
+    definitions = new Map();
+    configVersions = {
+      findOneAndUpdate: jest.fn((key, update) => {
+        const mapKey = `${key.tenantId}:${key.configId}:${key.version}`;
+        if (!definitions.has(mapKey)) definitions.set(mapKey, update.$setOnInsert);
+        return query(definitions.get(mapKey));
+      }),
+      findOne: jest.fn((key) => query(definitions.get(`${key.tenantId}:${key.configId}:${key.version}`) || null)),
+    };
+    service = new ExportsService(jobs, queue, configVersions);
     service.outputDir = dir;
     processor = new ExportsProcessor(jobs, inspections);
     processor.outputDir = dir;
@@ -130,9 +144,14 @@ describe("export jobs", () => {
       id,
       status: "QUEUED",
     });
-    expect(jobs.create).toHaveBeenCalledWith(
-      expect.objectContaining({ status: "QUEUED", config }),
-    );
+    expect(jobs.create).toHaveBeenCalledWith(expect.objectContaining({
+      status: "QUEUED",
+      config: { ...config, configId: "inspection-report", version: 1, type: "csv", outputSchemaVersion: 1 },
+      configId: "inspection-report", configVersion: 1, outputSchemaVersion: 1,
+    }));
+    expect(ExportJobSchema.path("config").options.immutable).toBe(true);
+    expect(ExportConfigVersionSchema.indexes().some(([keys, options]) => keys.tenantId && keys.configId && keys.version && options.unique)).toBe(true);
+    expect(ExportConfigVersionSchema.path("config").options.immutable).toBe(true);
     expect(queue.add).toHaveBeenCalledWith(
       "export",
       { exportJobId: id },
@@ -144,6 +163,25 @@ describe("export jobs", () => {
         ExportsController.prototype.create,
       ),
     ).toBe(202);
+  });
+  test("pins a copied versioned configuration snapshot to each job", async () => {
+    const supplied = { ...config, configId: "inspection-report", version: 2, outputSchemaVersion: 1, fields: ["id"] };
+    await service.create(supplied);
+    supplied.fields.push("confidence");
+    expect(jobs.create.mock.calls[0][0].config).toMatchObject({ configId: "inspection-report", version: 2, outputSchemaVersion: 1, fields: ["id"] });
+  });
+  test("rejects changes to an already-used configuration revision", async () => {
+    await service.create({ ...config, configId: "quality-report", version: 1 });
+    await expect(service.create({ ...config, configId: "quality-report", version: 1, fields: ["id"] })).rejects.toMatchObject({ status: 409 });
+    expect(jobs.create).toHaveBeenCalledTimes(1);
+    await expect(service.create({ ...config, configId: "quality-report", version: 2, fields: ["id"] })).resolves.toMatchObject({ status: "QUEUED" });
+  });
+  test("new configuration revisions do not alter earlier job snapshots", async () => {
+    await service.create({ ...config, configId: "versioned-report", version: 1 });
+    const original = jobs.create.mock.calls[0][0].config;
+    await service.create({ ...config, configId: "versioned-report", version: 2, fields: ["id"] });
+    expect(original).toMatchObject({ version: 1, fields: ["result", "id"] });
+    expect(jobs.create.mock.calls[1][0].config).toMatchObject({ version: 2, fields: ["id"] });
   });
   test("records queue submission failure safely", async () => {
     queue.add.mockRejectedValue(new Error("redis password"));

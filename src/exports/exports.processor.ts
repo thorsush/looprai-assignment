@@ -9,6 +9,7 @@ import { join, resolve } from "node:path";
 import { createCsv } from "../exporter";
 import { InspectionsService } from "../inspections/inspections.service";
 import { ExportJob } from "./export-job.schema";
+import { resolveExportConfig } from "./dto/create-export.dto";
 
 async function fileHash(path: string): Promise<string> {
   const digest = createHash("sha256");
@@ -53,6 +54,8 @@ export class ExportsProcessor extends WorkerHost {
     const existing = await this.jobs.findById(id).lean().exec();
     if (!existing) throw new UnrecoverableError("Export job not found");
     if (existing.status === "FAILED") return;
+    const configSnapshot = resolveExportConfig(existing.config);
+    if (configSnapshot.type !== "csv" || configSnapshot.outputSchemaVersion !== 1) throw new UnrecoverableError("Unsupported export schema version");
     if (existing.status === "COMPLETED") {
       if (
         !existing.outputHash ||
@@ -133,7 +136,7 @@ export class ExportsProcessor extends WorkerHost {
         const upperBoundId = await this.inspections.upperBound(
           claimed.tenantId,
           claimed.workspaceId,
-          claimed.config.filters?.result,
+          configSnapshot.filters?.result,
         );
         const totalRecords =
           upperBoundId === null
@@ -142,7 +145,7 @@ export class ExportsProcessor extends WorkerHost {
                 claimed.tenantId,
                 claimed.workspaceId,
                 upperBoundId,
-                claimed.config.filters?.result,
+                configSnapshot.filters?.result,
               );
         await checkpoint({
           upperBoundId,
@@ -177,8 +180,8 @@ export class ExportsProcessor extends WorkerHost {
         const config = {
           tenantId: claimed.tenantId,
           workspaceId: claimed.workspaceId,
-          fields: claimed.config.fields,
-          resultFilter: claimed.config.filters?.result,
+          fields: configSnapshot.fields,
+          resultFilter: configSnapshot.filters?.result,
           outputFilename: `${id}.csv`,
         };
         let position = offset;
@@ -196,7 +199,7 @@ export class ExportsProcessor extends WorkerHost {
             claimed.upperBoundId,
             claimed.lastProcessedId,
             claimed.batchSize,
-            claimed.config.filters?.result,
+            configSnapshot.filters?.result,
           );
           if (!batch.length) break;
           await this.testHook("beforeBatch");

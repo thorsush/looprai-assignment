@@ -5,3 +5,6 @@ output/*.csv
 .env
 output/*.tmp
 output/*.part
+coverage/
+*.log
+mongo-data/

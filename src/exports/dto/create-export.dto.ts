@@ -3,7 +3,6 @@ import {
   ArrayMinSize,
   ArrayUnique,
   IsArray,
-  IsBoolean,
   IsIn,
   IsNotEmpty,
   IsObject,
@@ -34,7 +33,4 @@ export class CreateExportDto {
   @Type(() => ExportFiltersDto)
   filters?: ExportFiltersDto;
 
-  @ValidateIf((_object, value) => value !== undefined)
-  @IsBoolean()
-  simulateFailure?: boolean;
 }

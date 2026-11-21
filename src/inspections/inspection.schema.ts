@@ -12,3 +12,12 @@ export class Inspection {
   @Prop() imageUrl?: string;
 }
 export const InspectionSchema = SchemaFactory.createForClass(Inspection);
+// Both indexes use simple collation; the second supports filtered exports.
+InspectionSchema.index(
+  { tenantId: 1, workspaceId: 1, id: 1 },
+  { collation: { locale: "simple" } },
+);
+InspectionSchema.index(
+  { tenantId: 1, workspaceId: 1, result: 1, id: 1 },
+  { collation: { locale: "simple" } },
+);

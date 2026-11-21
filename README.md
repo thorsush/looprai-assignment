@@ -1,23 +1,34 @@
-# Loopr customer-configurable exports — Stage 3
+# Loopr customer-configurable exports — Stage 4
 
-This incremental learning project extends the Stage 1 CSV exporter and Stage 2 NestJS/MongoDB API with background export jobs using BullMQ and Redis. It is not the complete assignment.
+This learning project extends the Stage 1 CSV logic, Stage 2 NestJS/MongoDB API and Stage 3 BullMQ queue with bounded batches, durable checkpoints and local crash recovery. It is not the complete assignment.
 
-## Architecture and lifecycle
+## Architecture
 
-A tenant has workspaces; each workspace has sessions and inspection records. The sample JSON contains 12 records. The seed upserts them into MongoDB by record ID. JSON remains available for the original Stage 1 CLI.
+`POST /exports` validates a customer configuration, snapshots it in a MongoDB job and queues its ID in Redis/BullMQ; it returns HTTP 202. The worker reads inspections for that tenant and workspace, generates the CSV, and checkpoints each committed batch. `GET /exports/:id` exposes status and progress, and `GET /exports/:id/download` streams a completed file. The API and worker are in one NestJS process. Run **only one instance** of this application for Stage 4; worker concurrency is one. Redis schedules up to three attempts with exponential backoff starting at two seconds.
 
-1. `POST /exports` validates the request, creates a MongoDB job with `QUEUED` status, and submits its MongoDB ID to the Redis-backed BullMQ queue. It returns HTTP 202 without waiting for the CSV.
-2. The BullMQ processor in the same NestJS process picks up the job, sets `PROCESSING`, and reads inspection records scoped to both tenant and workspace. The existing framework-independent exporter filters results, selects columns and escapes CSV.
-3. The processor updates the MongoDB counts and percentage in batches of two selected records. It writes a unique temporary file, records its SHA-256 checksum, then atomically renames the file to `output/<job-id>.csv` on the same filesystem. Only then does it mark the job `COMPLETED`.
-4. Clients poll `GET /exports/:id` and use `GET /exports/:id/download` once complete. Failed or unfinished downloads return 409; a missing job or output file returns 404.
+The sample JSON contains 12 records arranged as tenant → workspace → session → inspection; the seed upserts by inspection ID. The Stage 1 CLI and CSV functions remain available. Result filters, selected field order, CSV escaping and spreadsheet-formula protection are unchanged. Configuration is stored on the job, rather than read from a mutable customer configuration during processing.
 
-MongoDB stores the configuration, status, counts, attempt count, timestamps and safe errors. Redis stores BullMQ queue state, schedules retries and coordinates workers; it is not the source of truth for the API's job details. The controller handles HTTP, the service creates and retrieves jobs, and the processor performs exports. Three attempts are configured with exponential backoff starting at two seconds and worker concurrency two. Completed queue entries are retained for one day and failures for seven days (BullMQ removes aged entries lazily).
+## Batches and consistency
 
-Progress counts **selected records** processed into the in-memory CSV, after the result filter. A value of 100 does not guarantee that the file is published or durable; check `COMPLETED`. With this small dataset a job may complete before polling observes intermediate percentages.
+At the first attempt, the worker persists the largest matching inspection ID, a count, and `EXPORT_BATCH_SIZE` (default 1000) with the job. It queries each next batch by tenant, workspace, optional result, `id > lastProcessedId`, and `id <= upperBoundId`, sorted by `id` with MongoDB's simple binary collation. It does not use `skip`, whose work increases with the offset and whose pages shift when records are inserted. The inspection schema includes compound indexes for both filtered and unfiltered queries.
 
-## Run locally
+Sample IDs are unique immutable strings such as `a-001`; ordering is **binary lexicographic**, not numeric (`a-10` sorts before `a-2`). This stage assumes records are append-only, IDs are unique and immutable, and newly visible IDs for a tenant/workspace are always greater than earlier visible IDs. The fixtures illustrate ordering but do not enforce a production ID allocator. The upper bound excludes later higher IDs; it is **not snapshot isolation** if records change, are deleted, backfilled or become visible out of order. A production ingestion system must enforce the assumptions or use a stronger snapshot mechanism.
 
-Requirements: Node.js 20+, npm and Docker Compose. From the project root:
+## Checkpoints and recovery
+
+The job stores `upperBoundId`, `lastProcessedId`, `processedRecords`, `totalRecords`, `outputOffsetBytes`, `batchSize`, `checkpointVersion`, status, attempts and timestamps. An offset is a **byte count**, not a character count. Progress counts committed selected records; 100% alone does not mean the final file has been published.
+
+The worker writes a header once into `output/<id>.part`. For each bounded batch it serializes only that batch using the existing CSV logic, writes all bytes, syncs the file, and only then saves the offset and last ID to MongoDB. On retry, a file longer than the saved offset is truncated to it and synced; the worker resumes after the saved ID. A missing or shorter file with a nonzero offset is an unrecoverable local-file error. This avoids silently skipping data.
+
+For example, with `id,result` and batch size 3, the header is 11 bytes. Rows `a-001,PASS`, `a-002,FAIL`, and `a-003,FAIL` each occupy 12 bytes including CRLF. After committing them, the checkpoint is `lastProcessedId=a-003`, `processedRecords=3`, `outputOffsetBytes=47`. If `a-004` is written and synced but the worker dies before the next checkpoint, the file is 59 bytes while MongoDB still says 47. Recovery truncates it back to 47 and writes `a-004` again, resulting in one row for that ID.
+
+After the last batch, the worker syncs the file, records a streaming SHA-256 hash and final offset, atomically renames it on the same filesystem to `output/<id>.csv`, syncs the containing directory, then marks the job `COMPLETED`. A retry after rename checks finalization metadata, size and hash before completing the job. Inconsistent final files are rejected. Directory sync is not supported by every filesystem or operating system; errors are surfaced instead of claiming successful durable publication. Existing Stage 3 jobs and files do not have Stage 4 offsets and should be completed or migrated before upgrading; this prototype does not migrate them.
+
+The protocol assumes one active writer and a durable local filesystem. BullMQ is at least once: processing may repeat after a crash. Truncation and checkpointing aim to produce one copy of each record under the stated assumptions; they do not guarantee exactly-once execution. Queue locks do not fence a stale process after lock loss, and the filesystem is not a distributed durable store. Multiple app/worker instances or a delayed stale worker can violate the single-writer assumption.
+
+## Local setup and APIs
+
+Install Node.js 20+, npm and Docker Compose. From the project root:
 
 ```sh
 npm install
@@ -27,47 +38,28 @@ npm run seed
 npm run start
 ```
 
-The seed is safe to repeat. MongoDB uses a Docker volume. Redis connection settings and the server port are in `.env`. The API and worker use the same local `output/` directory and must share it if separated into processes.
-
-Create an export (the sample workspace is `assembly`):
+For a small demonstration, set `EXPORT_BATCH_SIZE=3` in `.env` before starting. MongoDB uses a Docker volume. The seed can be repeated without duplicate records. Use a single app instance and keep its `output/` on the same persistent filesystem across restarts.
 
 ```sh
 curl -sS -X POST http://localhost:3000/exports \
   -H 'Content-Type: application/json' \
-  -d '{"tenantId":"tenant-a","workspaceId":"assembly","fields":["id","result","timestamp"],"filters":{"result":"FAIL"}}'
-```
-
-Copy the returned `id` into the following commands:
-
-```sh
+  -d '{"tenantId":"tenant-a","workspaceId":"assembly","fields":["id","result"]}'
 JOB_ID=replace-with-returned-id
 curl -sS "http://localhost:3000/exports/$JOB_ID"
 curl -fS "http://localhost:3000/exports/$JOB_ID/download" -o export.csv
 ```
 
-To observe an automatic retry, run in development mode (do not set `NODE_ENV=production`):
+The sample configuration exports four records in two batches at size 3. A missing job or output returns 404; an unfinished or failed job cannot be downloaded (409). The original standalone example remains available with `npm run export -- config/customer-a.json`.
 
-```sh
-curl -sS -X POST http://localhost:3000/exports \
-  -H 'Content-Type: application/json' \
-  -d '{"tenantId":"tenant-a","workspaceId":"assembly","fields":["id","result"],"simulateFailure":true}'
-```
-
-Poll its ID as above. The first attempt fails deterministically; after the two-second backoff the second succeeds. In production, requests specifying `simulateFailure` are rejected and the processor ignores it.
+## Tests and reproducible interruption
 
 ```sh
 npm test
-npm run export -- config/customer-a.json
+TEST_MONGODB_URI=mongodb://127.0.0.1:27017/looprai_recovery_test npm test
 ```
 
-The first command runs Jest job tests and the preserved Stage 1 Node tests. The second runs the original standalone JSON-based CLI without creating a database job.
+The first command runs unit tests and skips the MongoDB-dependent test if the variable is absent. The second also creates a temporary tenant and job in that database, launches a separate worker using batch size 3, waits until a batch has been synced but **before** its checkpoint is saved, sends SIGKILL, then starts a new worker process. It prints checkpoint state before and after recovery and verifies the final CSV has eight distinct records. Test records and temporary files are cleaned up. This is a real process interruption using MongoDB; it invokes the worker directly, rather than testing BullMQ lock-loss redelivery. Other crash points use deterministic in-process test hooks, not public request fields. The regular API path can be checked separately using the commands above with MongoDB and Redis running.
 
-## Reliability and boundaries
+## Remaining limitations
 
-BullMQ is **at least once**, not exactly once. Attempts write separate temporary files rather than appending. A checksum stored before the atomic rename lets a retry verify and finalize a published file after a crash; the completed file is never marked complete before publication. Attempt IDs guard MongoDB updates so an old failure cannot overwrite a completed job. Temporary files are removed on normal completion or caught errors; an abrupt process termination may leave orphaned temporary files that require manual cleanup. A local file and rename do not provide distributed durability, and simultaneous stalled executions can still race over the final path: this is not a full fencing protocol.
-
-MongoDB and Redis do not share a transaction. An enqueue error records a safe failure and returns 503, but a crash between MongoDB creation and enqueue can leave a `QUEUED` record with no queue entry. A network error can also make enqueue outcome ambiguous. There is no transactional outbox or automatic reconciliation in this stage. If MongoDB is unavailable during error handling, the job status may be stale. Redis and local-file persistence depend on the local environment; Compose's Redis is for development, not durable production setup.
-
-CSV escapes commas, quotes and line breaks, uses empty cells for missing values, and prefixes formula-like strings with an apostrophe. Tenant and workspace are both included in every inspection query. **Caller-supplied tenant IDs are not authentication**: job lookup and download are also unauthenticated. Production must derive tenant identity from authenticated authorization context and enforce access to each job.
-
-The prototype loads records and CSV into memory. It has no scheduling, streaming for large datasets, S3, ERP integration, or separate deployable workers. Stage 4 may improve checkpointing, crash recovery and distributed durability; those capabilities are not implemented here.
+MongoDB and Redis do not share a transaction. A crash between creating a MongoDB job and enqueueing it can leave a queued job without a queue entry; an enqueue error can have an ambiguous outcome. There is no outbox or automatic reconciliation. Data and checkpoints depend on local disk durability, and downloading relies on the same filesystem. There is no distributed fencing, database snapshot, scheduling, S3, ERP integration, or authentication. **Caller-supplied tenant IDs are not authorization**; production must derive tenant identity from an authenticated context and authorize job access. The `simulateFailure` request field from Stage 3 is no longer accepted; failure injection is test-only.

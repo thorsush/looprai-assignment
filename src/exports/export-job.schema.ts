@@ -17,6 +17,13 @@ export class ExportJob {
   @Prop({ default: 0 }) processedRecords!: number;
   @Prop({ default: 0 }) totalRecords!: number;
   @Prop({ default: 0 }) attemptCount!: number;
+  @Prop({ default: null, type: String }) lastProcessedId!: string | null;
+  @Prop({ default: 0 }) outputOffsetBytes!: number;
+  @Prop({ default: null, type: String }) upperBoundId!: string | null;
+  @Prop({ default: false }) snapshotInitialized!: boolean;
+  @Prop({ default: 0 }) batchSize!: number;
+  @Prop({ default: 0 }) checkpointVersion!: number;
+  @Prop({ default: false }) finalizing!: boolean;
   @Prop() outputPath?: string;
   @Prop() error?: string;
   @Prop() outputHash?: string;

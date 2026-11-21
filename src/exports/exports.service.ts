@@ -1,5 +1,4 @@
 import {
-  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -9,7 +8,8 @@ import { InjectModel } from "@nestjs/mongoose";
 import { InjectQueue } from "@nestjs/bullmq";
 import { Model } from "mongoose";
 import { Queue } from "bullmq";
-import { readFile } from "node:fs/promises";
+import { access } from "node:fs/promises";
+import { createReadStream, ReadStream } from "node:fs";
 import { join, resolve } from "node:path";
 import { CreateExportDto } from "./dto/create-export.dto";
 import { ExportJob } from "./export-job.schema";
@@ -23,12 +23,6 @@ export class ExportsService {
   ) {}
 
   async create(config: CreateExportDto) {
-    if (
-      process.env.NODE_ENV === "production" &&
-      config.simulateFailure !== undefined
-    ) {
-      throw new BadRequestException("Failure simulation is unavailable");
-    }
     const job = await this.jobs.create({
       tenantId: config.tenantId,
       workspaceId: config.workspaceId,
@@ -66,12 +60,14 @@ export class ExportsService {
     return { id: String(_id), ...details };
   }
 
-  async download(id: string): Promise<Buffer> {
+  async download(id: string): Promise<ReadStream> {
     const job = await this.findOne(id);
     if (job.status !== "COMPLETED")
       throw new ConflictException("Export is not available");
     try {
-      return await readFile(join(this.outputDir, `${id.toLowerCase()}.csv`));
+      const path = join(this.outputDir, `${id.toLowerCase()}.csv`);
+      await access(path);
+      return createReadStream(path);
     } catch {
       throw new NotFoundException("Export file not found");
     }
